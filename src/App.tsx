@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { nanoid } from "nanoid";
+import { connect } from "@tursodatabase/sync";
 
 interface Folder {
   id: string;
@@ -15,7 +16,45 @@ interface Note {
   updated_at: string;
 }
 
+var db: any = null;
+var syncing = false;
+
+async function exec(sql: string) {
+  if (!db) return;
+  try {
+    await db.exec(sql);
+  } catch (error) {
+    console.error("Database exec error:", error);
+  }
+}
+
+async function query(sql: string): Promise<any> {
+  if (!db) return [];
+  try {
+    const result = await (await db.prepare(sql)).all();
+    return Array.isArray(result) ? result : [];
+  } catch (error) {
+    console.error("Database query error:", error);
+    return [];
+  }
+}
+
+async function sync() {
+  if (syncing || !db) return;
+  syncing = true;
+  try {
+    await db.sync();
+  } catch (error) {
+    console.error("Sync failed:", error);
+  } finally {
+    syncing = false;
+    // Sync again after a random interval (1-3 seconds)
+    setTimeout(sync, (1 + Math.random() * 2) * 1000);
+  }
+}
+
 function App() {
+  const [isConnected, setIsConnected] = useState(false);
   const [folders, setFolders] = useState<Folder[]>([]);
   const [notes, setNotes] = useState<Note[]>([]);
   const [selectedFolderId, setSelectedFolderId] = useState<string>("all");
@@ -42,70 +81,70 @@ function App() {
     [selectedNoteId, saveTimeout],
   );
 
-  // Initialize folders and load data
-  const initializeData = () => {
-    // Load folders from localStorage or create defaults
-    const storedFolders = localStorage.getItem("notes_folders");
-    if (storedFolders) {
-      setFolders(JSON.parse(storedFolders));
-    } else {
-      const defaultFolders: Folder[] = [
-        {
-          id: "home",
-          name: "Home",
-          created_at: new Date().toISOString(),
-        },
-        {
-          id: "work",
-          name: "Work",
-          created_at: new Date().toISOString(),
-        },
-        {
-          id: "kids",
-          name: "Kids",
-          created_at: new Date().toISOString(),
-        },
-      ];
-      setFolders(defaultFolders);
-      localStorage.setItem("notes_folders", JSON.stringify(defaultFolders));
-    }
+  // Initialize database connection
+  const initializeDatabase = async () => {
+    try {
+      const database = await connect({
+        path: ":memory:",
+        url: import.meta.env.VITE_TURSO_URL,
+        authToken: import.meta.env.VITE_TURSO_AUTH_TOKEN,
+        clientName: "notes-app",
+      });
 
-    // Load notes from localStorage
-    const storedNotes = localStorage.getItem("notes_notes");
-    if (storedNotes) {
-      setNotes(JSON.parse(storedNotes));
+      db = database;
+      setIsConnected(true);
+
+      // Start syncing
+      sync();
+
+      // Load initial data
+      await loadData();
+    } catch (error) {
+      console.error("Failed to connect to database:", error);
     }
   };
 
-  const saveNotesToStorage = (notesToSave: Note[]) => {
-    localStorage.setItem("notes_notes", JSON.stringify(notesToSave));
-    setNotes(notesToSave);
+  // Load all data from database
+  const loadData = async () => {
+    await loadFolders();
+    await loadNotes();
   };
 
-  const createNote = (folderId: string) => {
+  // Load folders from database
+  const loadFolders = async () => {
+    const result = await query("SELECT * FROM folders ORDER BY created_at");
+    setFolders(result);
+  };
+
+  // Load notes from database
+  const loadNotes = async () => {
+    const result = await query("SELECT * FROM notes ORDER BY updated_at DESC");
+    setNotes(result);
+  };
+
+  const createNote = async (folderId: string) => {
     const noteId = nanoid();
     const now = new Date().toISOString();
-    const newNote: Note = {
-      id: noteId,
-      folder_id: folderId,
-      content: "New Note",
-      created_at: now,
-      updated_at: now,
-    };
+    const content = "New Note";
 
-    const updatedNotes = [newNote, ...notes];
-    saveNotesToStorage(updatedNotes);
+    await exec(
+      `INSERT INTO notes (id, folder_id, content, created_at, updated_at) VALUES ('${noteId}', '${folderId}', '${content}', '${now}', '${now}')`,
+    );
+
+    await loadNotes();
     setSelectedNoteId(noteId);
-    setNoteContent("New Note");
+    setNoteContent(content);
   };
 
-  const saveNoteContent = (noteId: string, content: string) => {
-    const updatedNotes = notes.map((note) =>
-      note.id === noteId
-        ? { ...note, content, updated_at: new Date().toISOString() }
-        : note,
+  const saveNoteContent = async (noteId: string, content: string) => {
+    const now = new Date().toISOString();
+    const escapedContent = content.replace(/'/g, "''"); // Escape single quotes for SQL
+
+    await exec(
+      `UPDATE notes SET content = '${escapedContent}', updated_at = '${now}' WHERE id = '${noteId}'`,
     );
-    saveNotesToStorage(updatedNotes);
+
+    await loadNotes();
   };
 
   const selectNote = (noteId: string) => {
@@ -116,9 +155,10 @@ function App() {
     }
   };
 
-  const deleteNote = (noteId: string) => {
-    const updatedNotes = notes.filter((note) => note.id !== noteId);
-    saveNotesToStorage(updatedNotes);
+  const deleteNote = async (noteId: string) => {
+    await exec(`DELETE FROM notes WHERE id = '${noteId}'`);
+
+    await loadNotes();
 
     if (selectedNoteId === noteId) {
       setSelectedNoteId(null);
@@ -148,13 +188,16 @@ function App() {
   };
 
   const getFilteredNotes = () => {
+    // Ensure notes is always an array
+    const notesArray = Array.isArray(notes) ? notes : [];
+
     if (selectedFolderId === "all") {
-      return notes.sort(
+      return [...notesArray].sort(
         (a, b) =>
           new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
       );
     }
-    return notes
+    return notesArray
       .filter((note) => note.folder_id === selectedFolderId)
       .sort(
         (a, b) =>
@@ -186,7 +229,7 @@ function App() {
   };
 
   useEffect(() => {
-    initializeData();
+    initializeDatabase();
   }, []);
 
   // Cleanup timeout on unmount
@@ -198,7 +241,32 @@ function App() {
     };
   }, [saveTimeout]);
 
+  // Periodic data refresh to show synced changes
+  useEffect(() => {
+    if (!db) return;
+
+    const refreshInterval = setInterval(async () => {
+      if (!syncing) {
+        await loadData();
+      }
+    }, 2000); // Refresh every 2 seconds
+
+    return () => clearInterval(refreshInterval);
+  }, [db]);
+
   const filteredNotes = getFilteredNotes();
+
+  if (!isConnected) {
+    return (
+      <div className="flex h-screen bg-gray-100 items-center justify-center">
+        <div className="text-center text-gray-500">
+          <div className="text-4xl mb-4">🔄</div>
+          <p className="text-xl mb-2">Connecting to database...</p>
+          <p className="text-gray-400">Please wait while we sync your notes</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen bg-gray-100">
@@ -206,6 +274,14 @@ function App() {
       <div className="w-64 bg-gray-200 border-r border-gray-300 flex flex-col">
         <div className="p-4 border-b border-gray-300">
           <h1 className="text-xl font-semibold text-gray-800">Notes</h1>
+          <div className="flex items-center mt-2">
+            <div
+              className={`w-2 h-2 rounded-full mr-2 ${syncing ? "bg-orange-500" : "bg-green-500"}`}
+            ></div>
+            <span className="text-xs text-gray-600">
+              {syncing ? "Syncing..." : "Online"}
+            </span>
+          </div>
         </div>
         <div className="flex-1 py-2">
           <button
@@ -220,7 +296,7 @@ function App() {
               <span className="text-blue-500 mr-3">📝</span>
               <span className="font-medium">All Notes</span>
               <span className="ml-auto text-sm text-gray-500">
-                {notes.length}
+                {Array.isArray(notes) ? notes.length : 0}
               </span>
             </div>
           </button>
@@ -238,7 +314,9 @@ function App() {
                 <span className="text-yellow-500 mr-3">📁</span>
                 <span className="font-medium">{folder.name}</span>
                 <span className="ml-auto text-sm text-gray-500">
-                  {notes.filter((n) => n.folder_id === folder.id).length}
+                  {Array.isArray(notes)
+                    ? notes.filter((n) => n.folder_id === folder.id).length
+                    : 0}
                 </span>
               </div>
             </button>
